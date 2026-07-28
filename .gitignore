@@ -1,0 +1,16 @@
+# Build artifacts
+/target
+Cargo.lock.orig
+
+# Model weights: NOT redistributable (Meta DINOv3 License).
+# Download + convert locally, see README.
+/models
+
+# Local test images (put your own jpg/png here)
+/test
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store

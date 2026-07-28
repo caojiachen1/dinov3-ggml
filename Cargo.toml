@@ -1,0 +1,25 @@
+[package]
+name = "dinov3-ggml"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "DINOv3 Vision Transformer inference with GGML (CPU / CUDA), matching the official HF implementation"
+repository = "https://github.com/caojiachen1/dinov3-ggml"
+readme = "README.md"
+keywords = ["dinov3", "ggml", "vit", "inference", "embedding"]
+categories = ["computer-vision", "science"]
+
+[features]
+default = []
+# GGML CUDA backend (requires CUDA toolkit + nvcc + CMake at build time)
+cuda = []
+
+[dependencies]
+anyhow = "1.0"
+image = "0.25"
+log = "0.4"
+rayon = "1"
+
+[build-dependencies]
+cc = "1.0"
+cmake = "0.1"
