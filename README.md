@@ -28,6 +28,20 @@ git submodule update --init --recursive
 
 ## Getting the model
 
+### Option A: download the pre-converted weights (ModelScope)
+
+The converted ViT-S/16 binary (`dinov3_vits16.bin`, ~86MB) is available on ModelScope:
+
+- Model page: https://www.modelscope.cn/models/cjc1887415157/dinov3-ggml
+
+```bash
+modelscope download cjc1887415157/dinov3-ggml dinov3_vits16.bin --local_dir ./models
+```
+
+Place the file at `models/dinov3_vits16.bin` (or point `GGML_MODEL_PATH` at it).
+
+### Option B: convert from the official checkpoint
+
 The DINOv3 weights are released by Meta under the
 [DINOv3 License](https://ai.meta.com/resources/models-and-libraries/dinov3-license/)
 and are **not** included in this repository. Download the ViT-S/16 checkpoint
