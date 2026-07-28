@@ -119,6 +119,19 @@ impl GgmlVitModel {
 
     /// Load weights from a raw binary file (see scripts/convert_weights.py).
     pub fn load_weights(&mut self, path: &Path) -> Result<()> {
+        // The raw format carries no header: catch config/file mismatches early
+        // by checking the exact expected size instead of failing mid-read.
+        let meta = std::fs::metadata(path)
+            .with_context(|| format!("Cannot access weight file {:?}", path))?;
+        let expected = self.config.weight_file_size();
+        anyhow::ensure!(
+            meta.len() == expected,
+            "Weight file {:?} is {} bytes, but the configured model expects {} bytes.\n\
+             The file was probably converted for a different architecture \
+             (see scripts/convert_weights.py --model).",
+            path, meta.len(), expected
+        );
+
         let c_path = CString::new(path.to_str().context("Invalid path encoding")?)
             .context("Path contains null byte")?;
         let ret = unsafe { ffi::ggml_vit_load_weights(self.inner, c_path.as_ptr()) };
@@ -131,7 +144,24 @@ impl GgmlVitModel {
 
     /// Run inference on a preprocessed NCHW float tensor
     /// ([1, 3, height, width] flattened). Returns output_dim() features.
+    ///
+    /// `height`/`width` must match the configured input size: the RoPE tables
+    /// and token grid are precomputed for it at model creation.
     pub fn infer(&self, input: &[f32], height: i32, width: i32) -> Result<Vec<f32>> {
+        // Validate before handing the pointer to C: a short slice would cause
+        // an out-of-bounds read, a wrong size silently corrupts the results.
+        anyhow::ensure!(
+            height as usize == self.config.input_height && width as usize == self.config.input_width,
+            "Input size {}x{} does not match the configured model input {}x{}",
+            width, height, self.config.input_width, self.config.input_height
+        );
+        let expected = 3 * self.config.input_height * self.config.input_width;
+        anyhow::ensure!(
+            input.len() == expected,
+            "Input tensor has {} floats, expected {} (3 x {} x {})",
+            input.len(), expected, self.config.input_height, self.config.input_width
+        );
+
         let output_size = self.config.output_dim() as i32;
         let mut output = vec![0.0f32; output_size as usize];
 

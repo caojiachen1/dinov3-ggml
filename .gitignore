@@ -14,3 +14,5 @@ Cargo.lock.orig
 .idea/
 *.swp
 .DS_Store
+*.md
+!README.md

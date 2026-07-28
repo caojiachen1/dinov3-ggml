@@ -94,6 +94,28 @@ impl VitConfig {
     pub fn output_dim(&self) -> usize {
         self.sequence_length() * self.hidden_size
     }
+
+    /// Expected size in bytes of the raw f32 weight file for this config
+    /// (layout produced by scripts/convert_weights.py).
+    pub fn weight_file_size(&self) -> u64 {
+        let h = self.hidden_size;
+        let i = self.intermediate_size;
+        let ps = self.patch_size;
+        let per_layer =
+            2 * h              // norm1 w+b
+            + 3 * h * h + 3 * h // qkv w+b
+            + h * h + h         // proj w+b
+            + 2 * h             // norm2 w+b
+            + i * h + i         // fc1 w+b
+            + i * h + h         // fc2 w+b
+            + 2 * h;            // ls1 + ls2 gamma
+        let total = h * 3 * ps * ps + h                  // patch embed w+b
+            + h                                          // cls token
+            + self.num_register_tokens * h               // register tokens
+            + self.num_layers * per_layer
+            + 2 * h;                                     // final norm w+b
+        (total * std::mem::size_of::<f32>()) as u64
+    }
 }
 
 #[cfg(test)]
@@ -107,5 +129,7 @@ mod tests {
         assert_eq!(c.num_patches(), 1024);
         assert_eq!(c.sequence_length(), 1029);
         assert_eq!(c.output_dim(), 1029 * 384);
+        // Known size of the converted ViT-S/16 weight file
+        assert_eq!(c.weight_file_size(), 86_403_072);
     }
 }
