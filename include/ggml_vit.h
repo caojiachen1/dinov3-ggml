@@ -22,6 +22,8 @@ typedef struct {
     float layer_scale_eps;    /* LayerScale initial value, typically 1.0 */
     /* RoPE config */
     float rope_freq_base;     /* DINOv3 rope_theta, typically 100.0 */
+    /* Max images per batched forward pass (0 or 1 = single-image graphs only) */
+    int max_batch;
 } vit_config_t;
 
 /* Opaque model handle */
@@ -65,6 +67,14 @@ int ggml_vit_load_weights(ggml_vit_model_t* model, const char* path);
 int ggml_vit_infer(ggml_vit_model_t* model,
                    const float* input, int height, int width,
                    float* output, int output_size);
+
+/* Run batched inference on n_images preprocessed images stored contiguously
+ * (each 3*height*width floats). Output receives n_images feature vectors
+ * back to back. output_size is the total buffer size in floats.
+ * Returns 0 on success, -1 on failure. */
+int ggml_vit_infer_batch(ggml_vit_model_t* model,
+                         const float* input, int n_images, int height, int width,
+                         float* output, int output_size);
 
 /* Free model and all associated resources. */
 void ggml_vit_destroy(ggml_vit_model_t* model);

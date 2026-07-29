@@ -155,9 +155,12 @@ fn build_ggml_cuda(ggml_src: &Path) {
         .define("GGML_CUDA", "ON")
         .define("GGML_BUILD_TESTS", "OFF")
         .define("GGML_BUILD_EXAMPLES", "OFF")
-        // Flash-attention kernels are not used by ggml_vit: big compile-time win
-        .define("GGML_CUDA_FA", "OFF")
+        // Flash-attention kernels for ggml_flash_attn_ext (F16 only keeps
+        // compile times manageable)
+        .define("GGML_CUDA_FA", "ON")
         .define("GGML_CUDA_FA_ALL_QUANTS", "OFF")
+        // CUDA graphs: the ViT graph topology is static, capture it once
+        .define("GGML_CUDA_GRAPHS", "ON")
         // NCCL is not needed for single-GPU inference
         .define("GGML_CUDA_NCCL", "OFF");
 
