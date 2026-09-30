@@ -32,6 +32,17 @@ pub struct VitConfig {
     /// env var if set, else 1 (lowest single-image latency). Throughput-oriented
     /// callers should set this explicitly (e.g. 32 at 256px input).
     pub max_batch: usize,
+    /// Allow DCT-scaled JPEG decode (libjpeg-turbo): pick the largest 1/8,
+    /// 1/4, 1/2 downscale whose dimensions still cover the model input.
+    /// Cuts decode cost on large photos; a deliberate approximation.
+    /// Default true (fast tier); accuracy-first callers set false.
+    pub scaled_decode: bool,
+    /// Decode only the first N scans of progressive JPEGs (libjpeg-turbo
+    /// scan limit). Progressive entropy decoding does not benefit from DCT
+    /// scaling, so this is the lever that breaks the progressive decode
+    /// wall; early scans carry most of the image structure. 0 = decode all
+    /// scans (exact). A deliberate approximation for the fast tier.
+    pub jpeg_scan_limit: u32,
 }
 
 impl VitConfig {
@@ -82,6 +93,8 @@ impl VitConfig {
             image_mean: [0.485, 0.456, 0.406],
             image_std: [0.229, 0.224, 0.225],
             max_batch: 0,
+            scaled_decode: true,
+            jpeg_scan_limit: 0,
         }
     }
 

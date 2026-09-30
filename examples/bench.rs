@@ -28,6 +28,8 @@ fn main() {
     let n_images: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(200);
     let res: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(518);
     let max_batch: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1);
+    // Optional: progressive-JPEG scan limit for the decode fast path
+    let scan_limit: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
 
     // --- 1. Test images into memory (BENCH_TEST_DIR overrides the default) ---
     let test_dir = PathBuf::from(
@@ -67,6 +69,7 @@ fn main() {
     let mut cfg = VitConfig::vit_small_16();
     cfg.input_height = res;
     cfg.input_width = res;
+    cfg.jpeg_scan_limit = scan_limit;
     std::env::set_var("GGML_VIT_MAX_BATCH", max_batch.to_string());
 
     let t = Instant::now();

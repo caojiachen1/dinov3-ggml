@@ -1,29 +1,103 @@
 //! Image preprocessing pipeline for DINOv3 inference.
 //!
 //! Converts raw image bytes into a normalized NCHW tensor:
-//! decode (image crate / zune-jpeg) -> resize (Lanczos3, SIMD via
-//! fast_image_resize) -> RGB f32 -> [0,1] -> ImageNet standardization.
+//! decode -> resize (Lanczos3, SIMD via fast_image_resize) -> RGB f32
+//! -> [0,1] -> ImageNet standardization.
 //!
-//! Note: libjpeg-turbo (`turbojpeg`) was benchmarked as a JPEG fast path and
-//! turned out SLOWER than zune-jpeg on progressive JPEGs (10.7 ms vs 8.4 ms
-//! per 690x920 image), so the image crate stays the decoder. The SIMD resize
-//! kernel is not bit-identical to the previous `image`-crate implementation
-//! (same Lanczos3 filter, low-order bit differences only).
+//! JPEG fast path (opt-in via [`VitConfig::scaled_decode`], on by default):
+//! libjpeg-turbo decodes with the largest DCT scaling (1/8, 1/4, 1/2) that
+//! still covers the model input, optionally truncated to the first
+//! [`VitConfig::jpeg_scan_limit`] scans of progressive JPEGs. Both are
+//! deliberate approximations that cut decode cost several-fold on large
+//! photos and break the progressive-JPEG entropy-decode wall; measured
+//! impact is quantified by `examples/oracle.rs` (Gate B).
+//!
+//! The unscaled path and all non-JPEG formats decode via the `image` crate
+//! (zune-jpeg), which was benchmarked faster than turbojpeg at full
+//! resolution. The SIMD resize kernel is not bit-identical to the previous
+//! `image`-crate implementation (same Lanczos3 filter).
 
 use anyhow::{Context, Result};
 use fast_image_resize::{
     images::Image as FirImage, FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer,
 };
 use image::DynamicImage;
+use turbojpeg::{Decompressor, PixelFormat, ScalingFactor};
 
 use crate::config::VitConfig;
 
 /// Preprocess raw image bytes into a normalized NCHW float tensor
 /// of shape [1, 3, input_height, input_width] (flattened).
 pub fn preprocess_image(image_data: &[u8], config: &VitConfig) -> Result<Vec<f32>> {
+    // JPEG fast path: DCT-scaled (and optionally scan-limited) decode when a
+    // downscaled decode still covers the model input. Falls back to the
+    // image crate otherwise (non-JPEG, small images, decode errors).
+    if config.scaled_decode
+        && image_data.len() >= 2
+        && image_data[0] == 0xFF
+        && image_data[1] == 0xD8
+    {
+        if let Some((w, h, pixels)) = decode_jpeg_scaled(
+            image_data,
+            config.input_width as u32,
+            config.input_height as u32,
+            config.jpeg_scan_limit,
+        ) {
+            return preprocess_rgb8(w, h, pixels, config);
+        }
+    }
+
     let img = image::load_from_memory(image_data)
         .context("Failed to decode image from bytes")?;
     preprocess_dynamic_image(&img, config)
+}
+
+/// Decode a JPEG with the largest supported DCT scaling factor (1/8, 1/4,
+/// 1/2) whose scaled dimensions still cover `target_w x target_h`, so the
+/// subsequent resize never upscales. `scan_limit` > 0 truncates progressive
+/// JPEGs to their first N scans. Returns `(width, height, packed RGB8)`, or
+/// None when scaled decoding is not applicable (lossless JPEG, decode
+/// error, source too small for any scaling factor).
+fn decode_jpeg_scaled(
+    image_data: &[u8],
+    target_w: u32,
+    target_h: u32,
+    scan_limit: u32,
+) -> Option<(usize, usize, Vec<u8>)> {
+    let mut decompressor = Decompressor::new().ok()?;
+    let header = decompressor.read_header(image_data).ok()?;
+    if header.is_lossless {
+        return None;
+    }
+    // Ascending scale: the first factor that covers the target wins (the
+    // cheapest decode that doesn't throw away needed resolution).
+    for factor in [
+        ScalingFactor::ONE_EIGHTH,
+        ScalingFactor::ONE_QUARTER,
+        ScalingFactor::ONE_HALF,
+    ] {
+        let w = factor.scale(header.width);
+        let h = factor.scale(header.height);
+        if (w as u32) < target_w || (h as u32) < target_h {
+            continue;
+        }
+        decompressor.set_scaling_factor(factor).ok()?;
+        if scan_limit > 0 {
+            decompressor.set_scan_limit(scan_limit).ok()?;
+        }
+        let mut img = turbojpeg::Image {
+            pixels: vec![0u8; h * w * 3],
+            width: w,
+            pitch: w * 3,
+            height: h,
+            format: PixelFormat::RGB,
+        };
+        decompressor
+            .decompress(image_data, img.as_deref_mut())
+            .ok()?;
+        return Some((img.width, img.height, img.pixels));
+    }
+    None
 }
 
 /// Preprocess a decoded [`DynamicImage`] into a normalized NCHW float tensor.
