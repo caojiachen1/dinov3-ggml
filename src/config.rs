@@ -28,6 +28,10 @@ pub struct VitConfig {
     pub image_mean: [f32; 3],
     /// ImageNet normalization standard deviation for RGB channels.
     pub image_std: [f32; 3],
+    /// Images per batched forward pass. 0 = auto: the `GGML_VIT_MAX_BATCH`
+    /// env var if set, else 1 (lowest single-image latency). Throughput-oriented
+    /// callers should set this explicitly (e.g. 32 at 256px input).
+    pub max_batch: usize,
 }
 
 impl VitConfig {
@@ -77,6 +81,7 @@ impl VitConfig {
             rope_freq_base: 100.0,
             image_mean: [0.485, 0.456, 0.406],
             image_std: [0.229, 0.224, 0.225],
+            max_batch: 0,
         }
     }
 
@@ -131,5 +136,11 @@ mod tests {
         assert_eq!(c.output_dim(), 1029 * 384);
         // Known size of the converted ViT-S/16 weight file
         assert_eq!(c.weight_file_size(), 86_403_072);
+    }
+
+    #[test]
+    fn test_max_batch_default_zero() {
+        // 0 = auto (env var / 1), so presets don't pin a batch size
+        assert_eq!(VitConfig::vit_small_16().max_batch, 0);
     }
 }

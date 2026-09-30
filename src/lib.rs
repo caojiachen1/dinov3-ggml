@@ -108,12 +108,14 @@ impl GgmlVitModel {
     /// Uses the CUDA backend when compiled with the `cuda` feature and a GPU
     /// is available (set `GGML_VIT_FORCE_CPU=1` to override), else CPU.
     pub fn new(config: VitConfig) -> Result<Self> {
-        // Batched-graph size (GGML_VIT_MAX_BATCH). Default 1: on GPUs already
-        // saturated by a single image, batching only adds latency.
+        // Batched-graph size. Effective value: GGML_VIT_MAX_BATCH env var >
+        // config.max_batch > 1 (lowest single-image latency). Note the C side
+        // applies the same env override, so both views stay consistent.
         let max_batch = std::env::var("GGML_VIT_MAX_BATCH")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&v| v >= 1)
+            .or_else(|| (config.max_batch > 0).then_some(config.max_batch))
             .unwrap_or(1);
         let ffi_config = ffi::vit_config_t {
             hidden_size: config.hidden_size as i32,
