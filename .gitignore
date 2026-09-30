@@ -9,6 +9,9 @@ Cargo.lock.orig
 # Local test images (put your own jpg/png here)
 /test
 
+# Generated baseline-scan JPEGs (examples/mkbaseline.rs output)
+/test_baseline
+
 # Editor / OS noise
 .vscode/
 .idea/

@@ -16,6 +16,7 @@ cuda = []
 
 [dependencies]
 anyhow = "1.0"
+fast_image_resize = "6"
 image = "0.25"
 log = "0.4"
 rayon = "1"

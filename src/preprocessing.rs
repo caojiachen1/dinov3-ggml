@@ -1,13 +1,20 @@
 //! Image preprocessing pipeline for DINOv3 inference.
 //!
 //! Converts raw image bytes into a normalized NCHW tensor:
-//! decode -> resize (Lanczos3) -> RGB f32 -> [0,1] -> ImageNet standardization.
+//! decode (image crate / zune-jpeg) -> resize (Lanczos3, SIMD via
+//! fast_image_resize) -> RGB f32 -> [0,1] -> ImageNet standardization.
 //!
-//! Must stay bit-identical with the preprocessing used by any reference
-//! backend when comparing features across implementations.
+//! Note: libjpeg-turbo (`turbojpeg`) was benchmarked as a JPEG fast path and
+//! turned out SLOWER than zune-jpeg on progressive JPEGs (10.7 ms vs 8.4 ms
+//! per 690x920 image), so the image crate stays the decoder. The SIMD resize
+//! kernel is not bit-identical to the previous `image`-crate implementation
+//! (same Lanczos3 filter, low-order bit differences only).
 
 use anyhow::{Context, Result};
-use image::{imageops::FilterType, DynamicImage};
+use fast_image_resize::{
+    images::Image as FirImage, FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer,
+};
+use image::DynamicImage;
 
 use crate::config::VitConfig;
 
@@ -21,15 +28,37 @@ pub fn preprocess_image(image_data: &[u8], config: &VitConfig) -> Result<Vec<f32
 
 /// Preprocess a decoded [`DynamicImage`] into a normalized NCHW float tensor.
 pub fn preprocess_dynamic_image(img: &DynamicImage, config: &VitConfig) -> Result<Vec<f32>> {
-    let resized = img.resize_exact(
-        config.input_width as u32,
-        config.input_height as u32,
-        FilterType::Lanczos3,
-    );
+    let rgb = img.to_rgb8();
+    let width = rgb.width() as usize;
+    let height = rgb.height() as usize;
+    preprocess_rgb8(width, height, rgb.into_raw(), config)
+}
 
-    let rgb = resized.to_rgb8();
-    let (width, height) = (rgb.width() as usize, rgb.height() as usize);
-    let pixels = rgb.as_raw();
+/// Preprocess an owned packed RGB8 buffer into a normalized NCHW float tensor.
+fn preprocess_rgb8(
+    src_w: usize,
+    src_h: usize,
+    pixels: Vec<u8>,
+    config: &VitConfig,
+) -> Result<Vec<f32>> {
+    let dst_w = config.input_width as u32;
+    let dst_h = config.input_height as u32;
+
+    // SIMD resize. Lanczos3 matches the filter previously used from the
+    // `image` crate; the fast_image_resize implementation is not bit-identical.
+    let src_image = FirImage::from_vec_u8(src_w as u32, src_h as u32, pixels, PixelType::U8x3)
+        .context("Invalid source image buffer")?;
+    let mut dst_image = FirImage::new(dst_w, dst_h, PixelType::U8x3);
+    let mut resizer = Resizer::new();
+    let options =
+        ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3));
+    resizer
+        .resize(&src_image, &mut dst_image, Some(&options))
+        .context("Resize failed")?;
+
+    let width = dst_w as usize;
+    let height = dst_h as usize;
+    let pixels = dst_image.buffer();
 
     // HWC -> NCHW with normalization
     let num_pixels = width * height;
@@ -55,6 +84,7 @@ pub fn preprocess_dynamic_image(img: &DynamicImage, config: &VitConfig) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::{DynamicImage, Rgb};
 
     #[test]
     fn test_preprocess_output_shape() {
@@ -69,7 +99,7 @@ mod tests {
         let config = VitConfig::vit_small_16();
         let mut img = DynamicImage::new_rgb8(10, 10);
         for pixel in img.as_mut_rgb8().unwrap().pixels_mut() {
-            *pixel = image::Rgb([255, 255, 255]);
+            *pixel = Rgb([255, 255, 255]);
         }
         let result = preprocess_dynamic_image(&img, &config).unwrap();
         // White pixel R channel: (1.0 - 0.485) / 0.229

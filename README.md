@@ -91,6 +91,21 @@ JPEG decode + resize:
 | CPU (AVX2, all cores) | ~1.6 s | — |
 | CUDA | ~50 ms | ~22 img/s |
 
+RTX 5080 (desktop), batch extraction via `extract_batch` with
+`GGML_VIT_MAX_BATCH` tuned per tier, SIMD resize (fast_image_resize):
+
+| Tier | Input | JPEG type | Throughput |
+|---|---|---|---|
+| high | 518×518, B=4 | baseline | ~350 img/s |
+| fast | 256×256 (261 tokens), B=32 | baseline | **~1400 img/s** |
+| fast | 256×256, B=32 | progressive (web) | ~740 img/s |
+
+The fast tier (256×256) exploits DINOv3's RoPE position encoding, which is
+resolution-agnostic; accuracy for near-duplicate detection should be
+validated per use case. Preprocessing uses SIMD Lanczos3 resize — same
+filter as before, not bit-identical to the previous `image`-crate kernel
+(see `examples/bench.rs` for stage-by-stage measurement).
+
 ## Environment variables
 
 | Variable | Effect |
