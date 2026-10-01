@@ -70,6 +70,7 @@ fn main() {
     cfg.input_height = res;
     cfg.input_width = res;
     cfg.jpeg_scan_limit = scan_limit;
+    let hidden_size = cfg.hidden_size;
     std::env::set_var("GGML_VIT_MAX_BATCH", max_batch.to_string());
 
     let t = Instant::now();
@@ -172,6 +173,19 @@ fn main() {
             cosine_similarity(&f[0], &f[2]),
             cosine_similarity(&f[1], &f[2]),
             feats[0].len()
+        );
+        // CLS-token view (first hidden_size dims, the global descriptor):
+        // similarity structure reference for app-level pooling
+        let mut c: Vec<Vec<f32>> = f.iter().map(|v| v[..hidden_size].to_vec()).collect();
+        for v in &mut c {
+            l2_normalize(v);
+        }
+        println!(
+            "[sim-cls] {:.4} {:.4} {:.4} (dim {})",
+            cosine_similarity(&c[0], &c[1]),
+            cosine_similarity(&c[0], &c[2]),
+            cosine_similarity(&c[1], &c[2]),
+            hidden_size
         );
     }
 }
