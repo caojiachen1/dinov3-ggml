@@ -82,6 +82,9 @@ fn decode_jpeg_scaled(
             continue;
         }
         decompressor.set_scaling_factor(factor).ok()?;
+        // Cheap chroma-upsample fast path (matters at 1/2 scale; no-op when
+        // all planes are scaled as at 1/8)
+        decompressor.set_fast_upsample(true).ok()?;
         if scan_limit > 0 {
             decompressor.set_scan_limit(scan_limit).ok()?;
         }
