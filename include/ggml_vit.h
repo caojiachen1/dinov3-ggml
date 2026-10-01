@@ -76,6 +76,17 @@ int ggml_vit_infer_batch(ggml_vit_model_t* model,
                          const float* input, int n_images, int height, int width,
                          float* output, int output_size);
 
+/* Batched inference returning only the CLS-token feature per image (the
+ * first hidden_size floats of each image's full output vector). Same
+ * forward pass as ggml_vit_infer_batch, but avoids materializing and
+ * downloading the full [seq_len * hidden_size] output when callers only
+ * need the global descriptor (~1029x less host transfer). output receives
+ * n_images * hidden_size floats; output_size is the total buffer size in
+ * floats. Returns 0 on success, -1 on failure. */
+int ggml_vit_infer_batch_cls(ggml_vit_model_t* model,
+                             const float* input, int n_images, int height, int width,
+                             float* output, int output_size);
+
 /* Free model and all associated resources. */
 void ggml_vit_destroy(ggml_vit_model_t* model);
 

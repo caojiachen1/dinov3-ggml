@@ -79,6 +79,15 @@ mod ffi {
             output: *mut c_float,
             output_size: c_int,
         ) -> c_int;
+        pub fn ggml_vit_infer_batch_cls(
+            model: *mut ggml_vit_model,
+            input: *const c_float,
+            n_images: c_int,
+            height: c_int,
+            width: c_int,
+            output: *mut c_float,
+            output_size: c_int,
+        ) -> c_int;
         pub fn ggml_vit_destroy(model: *mut ggml_vit_model);
         #[allow(dead_code)]
         pub fn ggml_vit_get_output_size(model: *const ggml_vit_model) -> c_int;
@@ -217,9 +226,34 @@ impl GgmlVitModel {
     }
 
     /// Run batched inference on `n_images` preprocessed images stored back to
-    /// back in `inputs` (each 3*H*W floats). Returns one feature vector per
-    /// image. Uses the prebuilt batched compute graph (max_batch per pass).
+    /// back in `inputs` (each 3*H*W floats). Returns one full feature vector
+    /// per image ([seq_len, hidden_size] flattened). Uses the prebuilt
+    /// batched compute graph (max_batch per pass).
     pub fn infer_batch(&self, inputs: &[f32], n_images: usize) -> Result<Vec<Vec<f32>>> {
+        let out_dim = self.config.output_dim();
+        let cls_only = false;
+        let out = self.infer_batch_impl(inputs, n_images, out_dim, cls_only)?;
+        Ok(out.chunks_exact(out_dim).map(|c| c.to_vec()).collect())
+    }
+
+    /// Like [`GgmlVitModel::infer_batch`], but returns only the CLS-token
+    /// feature (first `hidden_size` floats) per image: the same forward pass
+    /// while downloading ~1029x less data from the GPU. Use when callers
+    /// only need the global image descriptor.
+    pub fn infer_batch_cls(&self, inputs: &[f32], n_images: usize) -> Result<Vec<Vec<f32>>> {
+        let out_dim = self.config.hidden_size;
+        let cls_only = true;
+        let out = self.infer_batch_impl(inputs, n_images, out_dim, cls_only)?;
+        Ok(out.chunks_exact(out_dim).map(|c| c.to_vec()).collect())
+    }
+
+    fn infer_batch_impl(
+        &self,
+        inputs: &[f32],
+        n_images: usize,
+        out_dim: usize,
+        cls_only: bool,
+    ) -> Result<Vec<f32>> {
         anyhow::ensure!(n_images > 0, "infer_batch called with 0 images");
         let img_floats = 3 * self.config.input_height * self.config.input_width;
         anyhow::ensure!(
@@ -228,29 +262,41 @@ impl GgmlVitModel {
             inputs.len(), n_images * img_floats, n_images, img_floats
         );
 
-        let out_dim = self.config.output_dim();
         let mut output = vec![0.0f32; n_images * out_dim];
 
         let _guard = self.infer_lock.lock()
             .map_err(|_| anyhow::anyhow!("Inference lock poisoned"))?;
-        let ret = unsafe {
-            ffi::ggml_vit_infer_batch(
-                self.inner,
-                inputs.as_ptr(),
-                n_images as i32,
-                self.config.input_height as i32,
-                self.config.input_width as i32,
-                output.as_mut_ptr(),
-                (n_images * out_dim) as i32,
-            )
+        let ret = if cls_only {
+            unsafe {
+                ffi::ggml_vit_infer_batch_cls(
+                    self.inner,
+                    inputs.as_ptr(),
+                    n_images as i32,
+                    self.config.input_height as i32,
+                    self.config.input_width as i32,
+                    output.as_mut_ptr(),
+                    (n_images * out_dim) as i32,
+                )
+            }
+        } else {
+            unsafe {
+                ffi::ggml_vit_infer_batch(
+                    self.inner,
+                    inputs.as_ptr(),
+                    n_images as i32,
+                    self.config.input_height as i32,
+                    self.config.input_width as i32,
+                    output.as_mut_ptr(),
+                    (n_images * out_dim) as i32,
+                )
+            }
         };
         drop(_guard);
 
         if ret != 0 {
             anyhow::bail!("ViT batched inference failed");
         }
-
-        Ok(output.chunks_exact(out_dim).map(|c| c.to_vec()).collect())
+        Ok(output)
     }
 
     /// Images per batched forward pass (GGML_VIT_MAX_BATCH, default 1).
@@ -305,6 +351,18 @@ impl FeatureExtractor {
     /// ahead, while the GPU runs batched inference (max_batch images per
     /// forward pass) on the previous chunk.
     pub fn extract_batch(&self, images: &[&[u8]]) -> Result<Vec<Vec<f32>>> {
+        self.extract_batch_impl(images, false)
+    }
+
+    /// Like [`FeatureExtractor::extract_batch`], but each image yields only
+    /// its CLS-token feature (first `hidden_size` floats) — the same forward
+    /// pass while downloading ~1029x less from the GPU per image. Use when
+    /// callers only need the global descriptor.
+    pub fn extract_batch_cls(&self, images: &[&[u8]]) -> Result<Vec<Vec<f32>>> {
+        self.extract_batch_impl(images, true)
+    }
+
+    fn extract_batch_impl(&self, images: &[&[u8]], cls_only: bool) -> Result<Vec<Vec<f32>>> {
         if images.is_empty() {
             return Ok(Vec::new());
         }
@@ -353,13 +411,15 @@ impl FeatureExtractor {
             let mut features = Vec::with_capacity(images.len());
             for (n, flat) in rx {
                 let flat = flat?;
-                let mut out = self
-                    .model
-                    .infer_batch(&flat, n)
-                    .with_context(|| format!(
-                        "Batched ViT inference failed (images {}..{})",
-                        features.len() + 1, features.len() + n
-                    ))?;
+                let mut out = if cls_only {
+                    self.model.infer_batch_cls(&flat, n)
+                } else {
+                    self.model.infer_batch(&flat, n)
+                }
+                .with_context(|| format!(
+                    "Batched ViT inference failed (images {}..{})",
+                    features.len() + 1, features.len() + n
+                ))?;
                 features.append(&mut out);
             }
             Ok(features)

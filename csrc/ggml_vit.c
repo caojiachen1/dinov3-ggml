@@ -707,29 +707,47 @@ int ggml_vit_infer(ggml_vit_model_t* model,
     return 0;
 }
 
-int ggml_vit_infer_batch(ggml_vit_model_t* model,
-                         const float* input, int n_images, int height, int width,
-                         float* output, int output_size)
-{
+/* Shared batched-forward worker: runs the batched graph over the input in
+ * max_batch slices. cls_only=true downloads just the leading hidden_size
+ * floats (CLS token) of each image into output (n_images * hidden_size
+ * floats); false downloads full output_dim vectors. */
+static int infer_batch_impl(ggml_vit_model_t* model,
+                            const float* input, int n_images, int height, int width,
+                            float* output, int output_size, int cls_only) {
     if (n_images <= 0) return -1;
     if (height != model->config.input_height || width != model->config.input_width) {
         fprintf(stderr, "ggml_vit: input size %dx%d does not match configured %dx%d\n",
                 width, height, model->config.input_width, model->config.input_height);
         return -1;
     }
-    if ((size_t)output_size < (size_t)n_images * model->output_dim) return -1;
+    const int out_vec = cls_only ? model->config.hidden_size : model->output_dim;
+    if ((size_t)output_size < (size_t)n_images * out_vec) return -1;
 
     const size_t img_floats = (size_t)3 * height * width;
-    const size_t out_floats = (size_t)model->output_dim;
     const int B = model->max_batch;
 
     int done = 0;
     while (done < n_images) {
         int rem = n_images - done;
         if (rem == 1 || B <= 1) {
-            if (ggml_vit_infer(model, input + (size_t)done * img_floats, height, width,
-                               output + (size_t)done * out_floats, model->output_dim) != 0) {
-                return -1;
+            if (cls_only) {
+                /* Single-image graph writes the full vector: stage it and
+                 * copy the leading CLS floats into the compact output. */
+                float * tmp = (float*)malloc((size_t)model->output_dim * sizeof(float));
+                if (!tmp) return -1;
+                int rc = ggml_vit_infer(model, input + (size_t)done * img_floats, height, width,
+                                        tmp, model->output_dim);
+                if (rc == 0) {
+                    memcpy(output + (size_t)done * out_vec, tmp,
+                           (size_t)out_vec * sizeof(float));
+                }
+                free(tmp);
+                if (rc != 0) return -1;
+            } else {
+                if (ggml_vit_infer(model, input + (size_t)done * img_floats, height, width,
+                                   output + (size_t)done * out_vec, model->output_dim) != 0) {
+                    return -1;
+                }
             }
             done += 1;
             continue;
@@ -747,12 +765,37 @@ int ggml_vit_infer_batch(ggml_vit_model_t* model,
             return -1;
         }
 
-        ggml_backend_tensor_get(model->output_batch,
-                                output + (size_t)done * out_floats,
-                                0, (size_t)take * out_floats * sizeof(float));
+        if (cls_only) {
+            /* CLS of image i sits at byte offset i*output_dim in the
+             * [output_dim, B] output tensor: one tiny device read per image. */
+            for (int i = 0; i < take; i++) {
+                ggml_backend_tensor_get(model->output_batch,
+                                        output + (size_t)(done + i) * out_vec,
+                                        (size_t)i * model->output_dim * sizeof(float),
+                                        (size_t)out_vec * sizeof(float));
+            }
+        } else {
+            ggml_backend_tensor_get(model->output_batch,
+                                    output + (size_t)done * out_vec,
+                                    0, (size_t)take * model->output_dim * sizeof(float));
+        }
         done += take;
     }
     return 0;
+}
+
+int ggml_vit_infer_batch(ggml_vit_model_t* model,
+                         const float* input, int n_images, int height, int width,
+                         float* output, int output_size)
+{
+    return infer_batch_impl(model, input, n_images, height, width, output, output_size, 0);
+}
+
+int ggml_vit_infer_batch_cls(ggml_vit_model_t* model,
+                             const float* input, int n_images, int height, int width,
+                             float* output, int output_size)
+{
+    return infer_batch_impl(model, input, n_images, height, width, output, output_size, 1);
 }
 
 /* ======================================================================== */
