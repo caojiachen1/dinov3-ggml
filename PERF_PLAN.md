@@ -284,7 +284,7 @@ differ-rs `bench_perf`（test/ 为 5 张 690px progressive JPEG，RTX 5080）：
 
 **基线剖析（256² B32，每 eval 14.78 ms）**：MUL_MAT 6.2（含每次 GEMM 前后的隐藏 dtype 转换：F32→F16 src1 暂存 + F16→F32 输出回转，合计每层 ~460 MB 纯转换流量）+ elementwise/拷贝 8.7（59%，其中 RoPE 的 roll+mul+mul+add×2 链 4.9）+ fattn 1.5。
 
-**改动**（ggml-src submodule @782e3662 + csrc 重写）：
+**改动**（ggml-src submodule 782e3662+b140148 + csrc 重写）：
 
 1. **F16 激活流（CUDA 路径）**：`ggml_mul_mat_out()` 显式结果 dtype；cuBLAS 直写 F16（F32 累加），双向隐藏转换全消。norm 补 F16 in/out kernel；bias/cls/reg 前缀/patch 输出全 F16。CPU 回退保持全 F32 图（CPU mul_mat 深度绑定 F32 dst）
 2. **vision RoPE 替换 roll 链**：发现本版 ggml 自带 `GGML_ROPE_TYPE_VISION`（Gemma3n 视觉模式）与 DINOv3 RoPE 数学完全同构（sections [D/4,D/4]、theta=pos·base^(−4p/D)、rotate-half 配对、CLS/reg pos=0 恒等）。坐标以 2^21 量化进 int32 位置 + freq_factors 抵消尺度（角度误差 <1.5e-6 rad，低于 F32 cos/sin 精度）。roll+mul+mul+add×2+cast 链（6 kernel）→ 1 个 rope kernel，CPU/CUDA 双后端同享
@@ -304,6 +304,8 @@ differ-rs `bench_perf`（test/ 为 5 张 690px progressive JPEG，RTX 5080）：
 B 扫描新最优：256²→48（4659，vs B32 +2%）、518²→8、224²→48。端到端（bench e2e，progressive 测试图集）：256² 724 img/s（解码墙）、518² B8 452 img/s（此前 351，+29%）。融合后 GEMM 有效算力 ~99 TFLOPS ≈ 5080 F16 tensor 峰值（~113）的 88%——**GEMM 本身已达硬件极限**。
 
 **精度门（Gate B，dumpfeat 新旧对比 518²/256²×5 图）**：全特征余弦 ≥0.999992、CLS 余弦 ≥0.999985（门 0.999）；bench [sim] 偏移 ≤0.0002、[sim-cls] ≤0.0005（门 0.001）；CUDA 与 GGML_VIT_FORCE_CPU 双路径一致（≤0.0002）；oracle PASS；cargo test 双配置 7/7+1/1。
+
+**残差 ADD 融入 GEMM（beta=1+C=residual）已实现但常态不触发**：gallocr 会把已死的 fc1-gelu 缓冲复用给输出 tensor，src1 与 dst 别名时安全检查正确拒绝（防读写冲突）；属无害保留。
 
 **剩余构成（256² B32，6.5 ms）**：融合 GEMM ~2.2（硬件地板）+ fattn 1.17 + rope 0.83 + 残差 ADD 0.76 + proj/conv GEMM 0.76（proj 的 src1 仍 F32，fattn 输出改 F16 可再省 ~0.3，需动 fattn kernel 模板）+ norm 0.35。下一档收益需 fattn F16-out / add+norm 融合 / MMQ int8（改权重格式，精度另立门）。
 
