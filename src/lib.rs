@@ -160,6 +160,15 @@ impl GgmlVitModel {
             anyhow::bail!("Failed to load weights from {:?}", path);
         }
         log::info!("Loaded ViT weights from {:?}", path);
+
+        // Warm up: the first graph compute triggers CUDA kernel/module load
+        // and graph capture (~0.2-0.5 s). Doing it here at load time keeps
+        // that cost out of the first real inference.
+        let warmup_input = vec![0.0f32; 3 * self.config.input_height * self.config.input_width];
+        self.infer(&warmup_input, self.config.input_height as i32, self.config.input_width as i32)
+            .context("Model warmup inference failed")?;
+        log::info!("Model warmup complete (CUDA graph captured)");
+
         Ok(())
     }
 
