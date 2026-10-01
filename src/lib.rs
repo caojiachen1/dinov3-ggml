@@ -91,6 +91,7 @@ mod ffi {
         pub fn ggml_vit_destroy(model: *mut ggml_vit_model);
         #[allow(dead_code)]
         pub fn ggml_vit_get_output_size(model: *const ggml_vit_model) -> c_int;
+        pub fn ggml_vit_bench_graph(model: *mut ggml_vit_model, iters: c_int) -> f64;
     }
 }
 
@@ -302,6 +303,18 @@ impl GgmlVitModel {
     /// Images per batched forward pass (GGML_VIT_MAX_BATCH, default 1).
     pub fn max_batch(&self) -> usize {
         self.max_batch
+    }
+
+    /// Profiling: replay the prebuilt (batched) compute graph `iters` times
+    /// with no host transfer. Returns seconds per replay.
+    pub fn bench_graph(&self, iters: usize) -> Result<f64> {
+        let _guard = self.infer_lock.lock()
+            .map_err(|_| anyhow::anyhow!("Inference lock poisoned"))?;
+        let t = unsafe { ffi::ggml_vit_bench_graph(self.inner, iters as i32) };
+        if t < 0.0 {
+            anyhow::bail!("graph bench failed");
+        }
+        Ok(t)
     }
 
     /// Get the model configuration.

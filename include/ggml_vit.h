@@ -87,6 +87,11 @@ int ggml_vit_infer_batch_cls(ggml_vit_model_t* model,
                              const float* input, int n_images, int height, int width,
                              float* output, int output_size);
 
+/* Profiling helper: replay the prebuilt graph (batched graph when
+ * max_batch > 1) `iters` times with no host<->device transfer. Returns
+ * seconds per replay, or -1 on failure. */
+double ggml_vit_bench_graph(ggml_vit_model_t* model, int iters);
+
 /* Free model and all associated resources. */
 void ggml_vit_destroy(ggml_vit_model_t* model);
 

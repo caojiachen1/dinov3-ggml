@@ -27,6 +27,7 @@
 #include <windows.h>
 #else
 #include <unistd.h>
+#include <time.h>
 #endif
 
 /* ======================================================================== */
@@ -59,6 +60,12 @@ struct ggml_vit_model {
     /* Backend */
     ggml_backend_t backend;
 
+    /* CUDA backend: keep activations in F16 between GEMMs. Halves the
+     * elementwise bandwidth of the whole network and lets cuBLAS write GEMM
+     * outputs directly as F16 (skipping both hidden conversion passes).
+     * CPU builds stay all-F32 (CPU kernels are F32-only). */
+    int use_f16;
+
     /* Weight context and buffer */
     struct ggml_context * weight_ctx;
     struct ggml_backend_buffer * weight_buf;
@@ -66,17 +73,22 @@ struct ggml_vit_model {
     /* Global weights */
     struct ggml_tensor * patch_embed_w;  /* [PS, PS, 3, H] */
     struct ggml_tensor * patch_embed_b;  /* [H] */
-    struct ggml_tensor * cls_token;      /* [1, 1, 1, H] */
-    struct ggml_tensor * register_tok;   /* [1, 1, n_reg, H] */
+    /* CLS + register tokens, pre-broadcast over the batch dim: [H, 1+n_reg, B].
+     * Constant for every image, so a plain weight beats a per-forward repeat. */
+    struct ggml_tensor * token_prefix_1; /* [H, 1+n_reg, 1] */
+    struct ggml_tensor * token_prefix_B; /* [H, 1+n_reg, max_batch] */
     struct ggml_tensor * norm_w;         /* [H] */
     struct ggml_tensor * norm_b;         /* [H] */
 
     /* Per-layer weights */
     vit_layer_weights_t * layers;
 
-    /* DINOv3 RoPE tables [head_dim, 1, seq_len], identity rows for CLS/register tokens */
-    struct ggml_tensor * rope_cos;
-    struct ggml_tensor * rope_sin;
+    /* DINOv3 RoPE via GGML_OP_ROPE vision mode: quantized 2D positions
+     * [4*seq_len] I32 (y then x per token; CLS/register rows are 0 = identity)
+     * and freq factors [head_dim/2] F32 undoing the position quantization
+     * scale, so the kernel computes theta = 2*pi*coord*base^(-4p/D). */
+    struct ggml_tensor * rope_pos;
+    struct ggml_tensor * rope_ff;
 
     /* Graph allocator */
     ggml_gallocr_t galloc;
@@ -174,6 +186,8 @@ ggml_vit_model_t* ggml_vit_create(const vit_config_t* config) {
         model->backend = ggml_backend_cuda_init(0);
         if (model->backend) {
             fprintf(stderr, "ggml_vit: using CUDA backend (device 0)\n");
+            /* F16 activation stream between GEMMs (CUDA kernels patched for it) */
+            model->use_f16 = 1;
         } else {
             fprintf(stderr, "ggml_vit: CUDA init failed, falling back to CPU\n");
         }
@@ -204,19 +218,24 @@ ggml_vit_model_t* ggml_vit_create(const vit_config_t* config) {
     int n_heads = config->num_heads;
     int head_dim = model->head_dim;
     int I = config->intermediate_size;
+    int prefix_len = config->has_cls_token + n_reg;
+    enum ggml_type act = model->use_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
     struct ggml_context * ctx = model->weight_ctx;
 
     /* Create weight tensors. Large matmul/conv weights are stored as F16:
-     * halves bandwidth and enables tensor-core GEMM on CUDA. */
+     * halves bandwidth and enables tensor-core GEMM on CUDA. Biases and token
+     * constants follow the activation dtype so adds/concats stay same-type. */
     model->patch_embed_w = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, PS, PS, 3, H);
     model->patch_embed_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
     ggml_set_name(model->patch_embed_w, "patch_embed_w");
     ggml_set_name(model->patch_embed_b, "patch_embed_b");
 
-    model->cls_token = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, 1, H);
-    model->register_tok = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, n_reg, H);
-    ggml_set_name(model->cls_token, "cls_token");
-    ggml_set_name(model->register_tok, "register_tok");
+    model->token_prefix_1 = ggml_new_tensor_3d(ctx, act, H, prefix_len, 1);
+    ggml_set_name(model->token_prefix_1, "token_prefix_1");
+    if (model->max_batch > 1) {
+        model->token_prefix_B = ggml_new_tensor_3d(ctx, act, H, prefix_len, model->max_batch);
+        ggml_set_name(model->token_prefix_B, "token_prefix_B");
+    }
 
     model->norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
     model->norm_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
@@ -230,16 +249,16 @@ ggml_vit_model_t* ggml_vit_create(const vit_config_t* config) {
 
         /* QKV weight transposed for ggml_mul_mat: [H, 3*H] */
         L->qkv_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, H, 3 * H);
-        L->qkv_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3 * H);
+        L->qkv_b = ggml_new_tensor_1d(ctx, act, 3 * H);
         /* Proj weight transposed: [H, H] */
         L->proj_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, H, H);
-        L->proj_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+        L->proj_b = ggml_new_tensor_1d(ctx, act, H);
         /* FC1 weight transposed: [H, I] */
         L->fc1_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, H, I);
-        L->fc1_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, I);
+        L->fc1_b = ggml_new_tensor_1d(ctx, act, I);
         /* FC2 weight transposed: [I, H] */
         L->fc2_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, I, H);
-        L->fc2_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+        L->fc2_b = ggml_new_tensor_1d(ctx, act, H);
 
         snprintf(name, sizeof(name), "layer_%d_qkv_w", l);  ggml_set_name(L->qkv_w, name);
         snprintf(name, sizeof(name), "layer_%d_proj_w", l); ggml_set_name(L->proj_w, name);
@@ -247,67 +266,50 @@ ggml_vit_model_t* ggml_vit_create(const vit_config_t* config) {
         snprintf(name, sizeof(name), "layer_%d_fc2_w", l);  ggml_set_name(L->fc2_w, name);
     }
 
-    /* DINOv3 RoPE cos/sin tables: [head_dim, seq_len, 1], broadcast over the
-     * head dim of [head_dim, seq_len, n_heads] activations. The rotate-half
-     * sign is pre-folded into the sin table (first half negated). */
-    model->rope_cos = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, model->seq_len, 1);
-    model->rope_sin = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, model->seq_len, 1);
-    ggml_set_name(model->rope_cos, "rope_cos");
-    ggml_set_name(model->rope_sin, "rope_sin");
+    /* DINOv3 RoPE via the GGML vision rope mode: positions quantized to I32.
+     * Patch center coords normalized to [-1, +1]; the angle
+     * 2*pi*coord*base^(-4p/D) is expressed as pos*theta_scale^p / ff with
+     * pos = round(2*pi*coord*POS_SCALE) and ff = POS_SCALE (quantization
+     * error <= pi/POS_SCALE ~ 1.5e-6 rad, below F32 cos/sin precision).
+     * Token order matches HF DINOv3: [CLS, registers, patches]; CLS/register
+     * rows keep pos = 0 (rotation by angle 0 = identity). */
+    model->rope_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t)4 * model->seq_len);
+    model->rope_ff  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim / 2);
+    ggml_set_name(model->rope_pos, "rope_pos");
+    ggml_set_name(model->rope_ff, "rope_ff");
 
     /* Allocate weight tensors on the backend */
     model->weight_buf = ggml_backend_alloc_ctx_tensors(ctx, model->backend);
     if (!model->weight_buf) { ggml_vit_destroy(model); return NULL; }
 
-    /* Fill DINOv3 RoPE tables (after ggml_backend_alloc_ctx_tensors).
-     * Patch center coords normalized to [-1, +1], angle = 2*pi * coord * inv_freq with
-     * inv_freq[j] = base^(-4j/head_dim), angle layout [y(D/4), x(D/4)] tiled twice.
-     * Token order matches HF DINOv3: [CLS, registers, patches].
-     * CLS and register tokens are not rotated (cos = 1, sin = 0).
-     * The rotate-half sign is folded into the sin table: out = x*cos + roll(x, D/2)*sin'
-     * with sin'[0:D/2] = -sin, sin'[D/2:D] = +sin.
-     * Built on the host, then uploaded (backend buffer may be device memory). */
+    /* Fill the RoPE position/freq-factor tables (after allocation). */
     {
-        size_t n_vals = (size_t)head_dim * model->seq_len;
-        float * cos_data = (float *)malloc(n_vals * sizeof(float));
-        float * sin_data = (float *)malloc(n_vals * sizeof(float));
-        if (!cos_data || !sin_data) {
-            free(cos_data); free(sin_data);
+        const int64_t S = model->seq_len;
+        const int64_t n_prefix = config->has_cls_token + n_reg;
+        const float POS_SCALE = 2097152.0f; /* 2^21; max |2*pi*coord*POS_SCALE| ~ 13.2e6 fits I32 */
+        int32_t * pos = (int32_t *)malloc((size_t)4 * S * sizeof(int32_t));
+        float * ff = (float *)malloc((size_t)(head_dim / 2) * sizeof(float));
+        if (!pos || !ff) {
+            free(pos); free(ff);
             ggml_vit_destroy(model);
             return NULL;
         }
+        memset(pos, 0, (size_t)4 * S * sizeof(int32_t));
         const float two_pi = 6.28318530717958647692f;
-        const int D = head_dim;
-        const int n_prefix = config->has_cls_token + n_reg;
-        for (int t = 0; t < n_prefix; t++) {
-            for (int d = 0; d < D; d++) {
-                cos_data[(size_t)t * D + d] = 1.0f;
-                sin_data[(size_t)t * D + d] = 0.0f;
-            }
-        }
         for (int row = 0; row < model->grid_h; row++) {
             for (int col = 0; col < model->grid_w; col++) {
-                int t = n_prefix + row * model->grid_w + col;
+                int64_t t = n_prefix + (int64_t)row * model->grid_w + col;
                 float cy = 2.0f * (row + 0.5f) / model->grid_h - 1.0f;
                 float cx = 2.0f * (col + 0.5f) / model->grid_w - 1.0f;
-                float * c = cos_data + (size_t)t * D;
-                float * s = sin_data + (size_t)t * D;
-                for (int j = 0; j < D / 4; j++) {
-                    float inv_freq = powf(config->rope_freq_base, -4.0f * j / D);
-                    float ay = two_pi * cy * inv_freq;
-                    float ax = two_pi * cx * inv_freq;
-                    /* first half: sign folded in (-sin) */
-                    c[j]             = cosf(ay); s[j]             = -sinf(ay);
-                    c[D / 4 + j]     = cosf(ax); s[D / 4 + j]     = -sinf(ax);
-                    c[D / 2 + j]     = cosf(ay); s[D / 2 + j]     = sinf(ay);
-                    c[3 * D / 4 + j] = cosf(ax); s[3 * D / 4 + j] = sinf(ax);
-                }
+                pos[t]             = (int32_t)lrintf(two_pi * cy * POS_SCALE);
+                pos[S + t]         = (int32_t)lrintf(two_pi * cx * POS_SCALE);
             }
         }
-        ggml_backend_tensor_set(model->rope_cos, cos_data, 0, n_vals * sizeof(float));
-        ggml_backend_tensor_set(model->rope_sin, sin_data, 0, n_vals * sizeof(float));
-        free(cos_data);
-        free(sin_data);
+        for (int p = 0; p < head_dim / 2; p++) ff[p] = POS_SCALE;
+        ggml_backend_tensor_set(model->rope_pos, pos, 0, (size_t)4 * S * sizeof(int32_t));
+        ggml_backend_tensor_set(model->rope_ff, ff, 0, (size_t)(head_dim / 2) * sizeof(float));
+        free(pos);
+        free(ff);
     }
 
     /* Initialize graph allocator on the backend's buffer type */
@@ -339,8 +341,29 @@ int ggml_vit_load_weights(ggml_vit_model_t* model, const char* path) {
      * memory layout matches the GGML ne0-contiguous layout of the created tensors. */
     if (read_tensor(f, model->patch_embed_w) != 0) goto fail;
     if (read_tensor(f, model->patch_embed_b) != 0) goto fail;
-    if (read_tensor(f, model->cls_token) != 0) goto fail;
-    if (read_tensor(f, model->register_tok) != 0) goto fail;
+
+    /* CLS + register tokens: read the raw values and fill the pre-broadcast
+     * prefix tensors ([H, 1+n_reg, B], dtype = activation type). */
+    {
+        const int n_reg = model->config.num_register_tokens;
+        const int prefix_len = model->config.has_cls_token + n_reg;
+        const size_t one = (size_t)prefix_len * H;
+        float * tok = read_raw(f, one);
+        if (!tok) goto fail;
+        int ok = upload_tensor(model->token_prefix_1, tok) == 0;
+        if (ok && model->token_prefix_B) {
+            /* batch prefix = the same tokens repeated along the batch dim */
+            float * tokB = (float *)malloc(one * (size_t)model->max_batch * sizeof(float));
+            if (!tokB) { free(tok); goto fail; }
+            for (int b = 0; b < model->max_batch; b++) {
+                memcpy(tokB + (size_t)b * one, tok, one * sizeof(float));
+            }
+            ok = upload_tensor(model->token_prefix_B, tokB) == 0;
+            free(tokB);
+        }
+        free(tok);
+        if (!ok) goto fail;
+    }
 
     /* Per-layer weights. LayerNorm affine params are folded into the following
      * GEMM (W'(x) = W(w_n*x + b_n) => scale W columns by w_n, add W*b_n to the
@@ -435,7 +458,7 @@ fail:
 /* Graph building                                                            */
 /* ======================================================================== */
 
-/* Apply LayerNorm: norm(x, eps) * w + b */
+/* Apply LayerNorm: norm(x, eps) * w + b (F32 in/out; used for the final norm) */
 static struct ggml_tensor * apply_layer_norm(
     struct ggml_context * ctx,
     struct ggml_tensor * x,
@@ -449,20 +472,39 @@ static struct ggml_tensor * apply_layer_norm(
     return ggml_add(ctx, scaled, b);
 }
 
-/* Apply DINOv3 RoPE: x*cos + roll(x, D/2)*sin_signed
- * x: [head_dim, seq_len, n_heads], cos/sin: [head_dim, seq_len, 1] (broadcast
- * over heads). The rotate-half sign is pre-folded into the sin table. */
-static struct ggml_tensor * apply_rope(
+/* GEMM with the result kept in the activation dtype (F16 on CUDA: cuBLAS
+ * writes F16 directly, skipping the hidden F32 conversion round trip). */
+static struct ggml_tensor * mm_act(
+    ggml_vit_model_t * model,
+    struct ggml_context * ctx,
+    struct ggml_tensor * w,
+    struct ggml_tensor * x)
+{
+    if (model->use_f16) {
+        return ggml_mul_mat_out(ctx, w, x, GGML_TYPE_F16);
+    }
+    return ggml_mul_mat(ctx, w, x);
+}
+
+/* DINOv3 RoPE via the GGML vision rope mode.
+ * x: [head_dim, n_heads, seq_len, B] view of the QKV output; the kernel
+ * rotates half-pairs (p, p + D/2) with theta = pos(section) * base^(-4p/D),
+ * which matches DINOv3's [y(D/4), x(D/4)] axial layout exactly. CLS/register
+ * rows have pos 0 and pass through unchanged.
+ * out_type lets the Q rope produce F32 directly from the F16 stream (flash
+ * attention requires F32 Q) with no separate cast pass. */
+static struct ggml_tensor * apply_rope_vision(
+    ggml_vit_model_t * model,
     struct ggml_context * ctx,
     struct ggml_tensor * x,
-    struct ggml_tensor * cos_t,
-    struct ggml_tensor * sin_t)
+    enum ggml_type out_type)
 {
-    const int64_t D = x->ne[0];
-    struct ggml_tensor * rot = ggml_roll(ctx, x, (int)(D / 2), 0, 0, 0);
-    return ggml_add(ctx,
-                    ggml_mul(ctx, x, cos_t),
-                    ggml_mul(ctx, rot, sin_t));
+    int sections[GGML_MROPE_SECTIONS] = { model->head_dim / 4, model->head_dim / 4, 0, 0 };
+    return ggml_rope_multi_out(ctx, x, model->rope_pos, model->rope_ff,
+                               model->head_dim / 2, sections,
+                               GGML_ROPE_TYPE_VISION, 0,
+                               model->config.rope_freq_base,
+                               1.0f, 0.0f, 1.0f, 0.0f, 0.0f, out_type);
 }
 
 static struct ggml_tensor * build_forward(
@@ -483,6 +525,8 @@ static struct ggml_tensor * build_forward(
     int seq_len = model->seq_len;
     int B = batch;
     float eps = 1e-5f;  /* HF DINOv3 layer_norm_eps */
+    enum ggml_type act = model->use_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    struct ggml_tensor * prefix = (B > 1) ? model->token_prefix_B : model->token_prefix_1;
 
     /* === 1. Patch Embedding === */
     /* input: [W, H_img, 3, B], kernel: [PS, PS, 3, H] */
@@ -499,20 +543,20 @@ static struct ggml_tensor * build_forward(
     patches = ggml_reshape_3d(ctx, patches, n_patches, H, B);
     patches = ggml_cont(ctx, ggml_permute(ctx, patches, 1, 0, 2, 3));
 
-    /* === 2. Token Assembly (HF DINOv3 order: [CLS, registers, patches]) === */
-    /* CLS token: [H, 1] -> broadcast to [H, 1, B] */
-    struct ggml_tensor * tokens = ggml_reshape_2d(ctx, model->cls_token, H, 1);
-    if (B > 1) tokens = ggml_repeat_4d(ctx, tokens, H, 1, B, 1);
-
-    /* Concatenate registers: [H, 1 + n_reg, B] */
-    if (n_reg > 0) {
-        struct ggml_tensor * regs = ggml_reshape_2d(ctx, model->register_tok, H, n_reg);
-        if (B > 1) regs = ggml_repeat_4d(ctx, regs, H, n_reg, B, 1);
-        tokens = ggml_concat(ctx, tokens, regs, 1);
+    /* Enter the activation dtype (no-op view-free cast skipped for F32) */
+    if (act != GGML_TYPE_F32) {
+        patches = ggml_cast(ctx, patches, act);
     }
 
-    /* Concatenate patches: [H, seq_len, B] */
-    tokens = ggml_concat(ctx, tokens, patches, 1);
+    /* === 2. Token Assembly (HF DINOv3 order: [CLS, registers, patches]) === */
+    /* CLS+register prefix is a constant [H, 1+n_reg, B] weight (identical for
+     * every image), so the per-forward repeat disappears. */
+    struct ggml_tensor * tokens;
+    if (prefix->ne[1] > 0) {
+        tokens = ggml_concat(ctx, prefix, patches, 1);
+    } else {
+        tokens = patches;
+    }
 
     /* Flatten batch into the token dim: all per-layer GEMMs/norms run as one
      * large 2D op ([H, seq_len*B]) instead of B strided-batched ops, which is
@@ -530,48 +574,48 @@ static struct ggml_tensor * build_forward(
 
         /* QKV projection: [H, 3H] @ [H, seq_len*B] -> [3H, seq_len*B]
          * Each column is [q(H), k(H), v(H)] */
-        struct ggml_tensor * qkv = ggml_mul_mat(ctx, L->qkv_w, normed);
+        struct ggml_tensor * qkv = mm_act(model, ctx, L->qkv_w, normed);
         qkv = ggml_add(ctx, qkv, L->qkv_b);
 
-        /* Split into Q, K, V head-major views and permute to
-         * [head_dim, seq_len, n_heads, B] in a single cont each.
-         * Within a qkv column: head h of Q at offset h*head_dim, K at H, V at 2H. */
+        /* Head-major views [head_dim, n_heads, seq_len, B] straight into the
+         * QKV columns (rope consumes this layout directly). */
+        const size_t es = ggml_type_size(qkv->type);
         size_t qkv_nb3 = qkv->nb[1] * (size_t)seq_len;
         struct ggml_tensor * Qv = ggml_view_4d(ctx, qkv, head_dim, n_heads, seq_len, B,
-                                               (size_t)head_dim * sizeof(float),
+                                               (size_t)head_dim * es,
                                                qkv->nb[1], qkv_nb3,
                                                0);
         struct ggml_tensor * Kv = ggml_view_4d(ctx, qkv, head_dim, n_heads, seq_len, B,
-                                               (size_t)head_dim * sizeof(float),
+                                               (size_t)head_dim * es,
                                                qkv->nb[1], qkv_nb3,
-                                               (size_t)H * sizeof(float));
+                                               (size_t)H * es);
         struct ggml_tensor * Vv = ggml_view_4d(ctx, qkv, head_dim, n_heads, seq_len, B,
-                                               (size_t)head_dim * sizeof(float),
+                                               (size_t)head_dim * es,
                                                qkv->nb[1], qkv_nb3,
-                                               (size_t)2 * H * sizeof(float));
+                                               (size_t)2 * H * es);
 
-        struct ggml_tensor * Qp = ggml_cont(ctx, ggml_permute(ctx, Qv, 0, 2, 1, 3));
-        struct ggml_tensor * Kp = ggml_cont(ctx, ggml_permute(ctx, Kv, 0, 2, 1, 3));
-
-        /* Apply DINOv3 RoPE to Q and K (identity for CLS/register rows) */
-        Qp = apply_rope(ctx, Qp, model->rope_cos, model->rope_sin);
-        Kp = apply_rope(ctx, Kp, model->rope_cos, model->rope_sin);
+        /* DINOv3 RoPE on Q and K (identity for CLS/register rows), then plain
+         * permuted VIEWS into the [head_dim, seq_len, n_heads, B] layout
+         * flash attention wants — the fattn kernels read Q/K/V through their
+         * row strides, so no materializing copy is needed at all.
+         * Q comes out F32 (fattn requires it), K/V stay F16. */
+        struct ggml_tensor * Qp = apply_rope_vision(model, ctx, Qv, GGML_TYPE_F32);
+        struct ggml_tensor * Kp = apply_rope_vision(model, ctx, Kv, act);
+        Qp = ggml_permute(ctx, Qp, 0, 2, 1, 3);
+        Kp = ggml_permute(ctx, Kp, 0, 2, 1, 3);
+        struct ggml_tensor * Vp = ggml_permute(ctx, Vv, 0, 2, 1, 3);
 
         /* Fused flash attention.
-         * q: [head_dim, seq_len, n_heads, B], k/v likewise (V not transposed),
-         * K/V cast to F16 for the fattn kernels.
+         * q: [head_dim, seq_len, n_heads, B], k/v likewise (V not transposed).
          * Result: [head_dim, n_heads, seq_len, B] -> reshape to [H, seq_len*B]. */
-        struct ggml_tensor * Kp16 = ggml_cast(ctx, Kp, GGML_TYPE_F16);
-        struct ggml_tensor * Vp16 = ggml_cast(ctx, ggml_permute(ctx, Vv, 0, 2, 1, 3), GGML_TYPE_F16);
-
         float attn_scale = 1.0f / sqrtf((float)head_dim);
-        struct ggml_tensor * attn_out = ggml_flash_attn_ext(ctx, Qp, Kp16, Vp16, NULL,
+        struct ggml_tensor * attn_out = ggml_flash_attn_ext(ctx, Qp, Kp, Vp, NULL,
                                                             attn_scale, 0.0f, 0.0f);
         attn_out = ggml_reshape_2d(ctx, attn_out, H, (int64_t)seq_len * B);
 
         /* Output projection (ls1 LayerScale folded into weights/bias):
          * [H, H] @ [H, seq_len*B] -> [H, seq_len*B] */
-        struct ggml_tensor * proj_out = ggml_mul_mat(ctx, L->proj_w, attn_out);
+        struct ggml_tensor * proj_out = mm_act(model, ctx, L->proj_w, attn_out);
         proj_out = ggml_add(ctx, proj_out, L->proj_b);
 
         /* Residual */
@@ -584,21 +628,24 @@ static struct ggml_tensor * build_forward(
         normed = ggml_norm(ctx, tokens, eps);
 
         /* FC1: [H, I] @ [H, seq_len*B] -> [I, seq_len*B] */
-        struct ggml_tensor * hidden = ggml_mul_mat(ctx, L->fc1_w, normed);
+        struct ggml_tensor * hidden = mm_act(model, ctx, L->fc1_w, normed);
         hidden = ggml_add(ctx, hidden, L->fc1_b);
 
         /* GELU activation (exact erf variant, matching HF "gelu") */
         hidden = ggml_gelu_erf(ctx, hidden);
 
         /* FC2 (ls2 LayerScale folded in): [I, H] @ [I, seq_len*B] -> [H, seq_len*B] */
-        hidden = ggml_mul_mat(ctx, L->fc2_w, hidden);
+        hidden = mm_act(model, ctx, L->fc2_w, hidden);
         hidden = ggml_add(ctx, hidden, L->fc2_b);
 
         /* Residual */
         tokens = ggml_add(ctx, residual, hidden);
     }
 
-    /* === 4. Final LayerNorm === */
+    /* === 4. Final LayerNorm (F32: the output must stay F32) === */
+    if (act != GGML_TYPE_F32) {
+        tokens = ggml_cast(ctx, tokens, GGML_TYPE_F32);
+    }
     tokens = apply_layer_norm(ctx, tokens, model->norm_w, model->norm_b, eps);
 
     /* === 5. Output: flatten to [output_dim, B] === */
@@ -796,6 +843,40 @@ int ggml_vit_infer_batch_cls(ggml_vit_model_t* model,
                              float* output, int output_size)
 {
     return infer_batch_impl(model, input, n_images, height, width, output, output_size, 1);
+}
+
+/* Profiling helper: replay the prebuilt graph `iters` times with no input
+ * upload or output download (input tensor keeps its last contents).
+ * Returns seconds per replay, or -1 on failure. Syncs before and after.
+ * Runs 10 unmeasured warmup iterations first so one-time costs (CUDA graph
+ * instantiate, re-capture after gallocr realloc) stay out of the average. */
+double ggml_vit_bench_graph(ggml_vit_model_t* model, int iters)
+{
+    struct ggml_cgraph * g = model->max_batch > 1 ? model->graph_batch : model->graph;
+    if (!g || iters <= 0) return -1.0;
+    for (int i = 0; i < 10; i++) {
+        if (ggml_backend_graph_compute(model->backend, g) != GGML_STATUS_SUCCESS) return -1.0;
+    }
+    ggml_backend_synchronize(model->backend);
+#ifdef _WIN32
+    LARGE_INTEGER f, t0, t1;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+#else
+    struct timespec ts0, ts1;
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
+#endif
+    for (int i = 0; i < iters; i++) {
+        if (ggml_backend_graph_compute(model->backend, g) != GGML_STATUS_SUCCESS) return -1.0;
+    }
+    ggml_backend_synchronize(model->backend);
+#ifdef _WIN32
+    QueryPerformanceCounter(&t1);
+    return (double)(t1.QuadPart - t0.QuadPart) / (double)f.QuadPart / (double)iters;
+#else
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
+    return (ts1.tv_sec - ts0.tv_sec) + (ts1.tv_nsec - ts0.tv_nsec) * 1e-9;
+#endif
 }
 
 /* ======================================================================== */
