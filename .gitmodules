@@ -1,3 +1,4 @@
 [submodule "ggml-src"]
 	path = ggml-src
-	url = https://github.com/ggml-org/ggml.git
+	url = https://github.com/caojiachen1/ggml.git
+	branch = dinov3-vit-cuda
